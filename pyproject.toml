@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvbench"
+version = "0.1.0"
+description = "KV-cache quantization benchmark framework"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch==2.5.1",
+  "transformers==4.46.3",
+  "datasets==3.1.0",
+  "evaluate==0.4.3",
+  "accelerate==1.1.1",
+  "huggingface_hub==0.26.2",
+  "jsonlines==4.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
