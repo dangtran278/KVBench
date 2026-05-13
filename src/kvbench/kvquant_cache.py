@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -35,6 +35,7 @@ class KvQuantCacheState:
     v_fp16_prefix: Optional[torch.Tensor] = None
 
     total_len: int = 0
+    telemetry: list[dict[str, Any]] = field(default_factory=list)
 
 
 class KvQuantCache:
@@ -58,10 +59,17 @@ class KvQuantCache:
         self.use_nf = bool(use_nf)
 
         self._lut: Optional[torch.Tensor] = None
+        self._lut_fp32_cuda: Optional[torch.Tensor] = None
         self._k_thr_low: Optional[torch.Tensor] = None
         self._k_thr_high: Optional[torch.Tensor] = None
         self._v_thr_low: Optional[torch.Tensor] = None
         self._v_thr_high: Optional[torch.Tensor] = None
+        # Dynamic per-channel thresholds inferred from first append when LUT thresholds
+        # are not provided. Reusing these avoids per-step quantile/sort overhead in decode.
+        self._k_dyn_thr_low: Optional[torch.Tensor] = None  # (h, d)
+        self._k_dyn_thr_high: Optional[torch.Tensor] = None  # (h, d)
+        self._v_dyn_thr_low: Optional[torch.Tensor] = None  # (h, d)
+        self._v_dyn_thr_high: Optional[torch.Tensor] = None  # (h, d)
 
     def init_state(self) -> KvQuantCacheState:
         return KvQuantCacheState()
@@ -70,6 +78,11 @@ class KvQuantCache:
         self._lut = lut.lut
         self._k_thr_low = lut.thr_low
         self._k_thr_high = lut.thr_high
+        # External thresholds supersede dynamic fallback.
+        self._k_dyn_thr_low = None
+        self._k_dyn_thr_high = None
+        self._v_dyn_thr_low = None
+        self._v_dyn_thr_high = None
         if lut_v is None:
             self._v_thr_low = lut.thr_low
             self._v_thr_high = lut.thr_high
@@ -81,6 +94,12 @@ class KvQuantCache:
         if self._lut is None:
             self._lut = build_nf_lut(self.bits, device=device, dtype=dtype if self.use_nf else torch.float16)
         return self._lut.to(device=device, dtype=dtype)
+
+    def get_triton_lut(self, device: torch.device) -> torch.Tensor:
+        """Return cached fp32 contiguous LUT for Triton kernels."""
+        if self._lut_fp32_cuda is None or self._lut_fp32_cuda.device != device:
+            self._lut_fp32_cuda = self._ensure_lut(device, dtype=torch.float32).contiguous()
+        return self._lut_fp32_cuda
 
     def append(self, state: KvQuantCacheState, k: torch.Tensor, v: torch.Tensor) -> KvQuantCacheState:
         """Append new KV (already RoPE-applied for K if model uses RoPE).
@@ -107,25 +126,16 @@ class KvQuantCache:
                 if t_new == 0:
                     return state
 
-        # outlier thresholds (fallback: dynamic per append if thresholds absent)
+        # outlier thresholds
         if self._k_thr_low is None or self._k_thr_high is None:
-            # per-channel thresholds (flatten heads*dim)
-            flat = k.reshape(b, h, t_new, d).reshape(b, h * d, t_new).transpose(1, 2)  # (b, t, h*d)
-            # torch.quantile with a tensor of quantiles has shape-order differences across versions.
-            # Use scalar quantiles for deterministic (b, t_new) outputs.
-            thr_low = torch.quantile(
-                flat.float(),
-                self.outlier_percent / 2.0,
-                dim=-1,
-            )  # (b, t_new)
-            thr_high = torch.quantile(
-                flat.float(),
-                1.0 - self.outlier_percent / 2.0,
-                dim=-1,
-            )  # (b, t_new)
-            # Broadcast across heads and channel dim.
-            thr_low = thr_low[:, None, :, None]  # (b, 1, t_new, 1)
-            thr_high = thr_high[:, None, :, None]  # (b, 1, t_new, 1)
+            if self._k_dyn_thr_low is None or self._k_dyn_thr_high is None or self._k_dyn_thr_low.shape != (h, d):
+                # One-time fallback: infer per-(head,dim) thresholds across batch*token.
+                # Reused on subsequent decode appends to avoid repeated quantile/sort cost.
+                k_hd_bt = k.permute(1, 3, 0, 2).reshape(h, d, b * t_new).float()
+                self._k_dyn_thr_low = torch.quantile(k_hd_bt, self.outlier_percent / 2.0, dim=-1).detach()
+                self._k_dyn_thr_high = torch.quantile(k_hd_bt, 1.0 - self.outlier_percent / 2.0, dim=-1).detach()
+            thr_low = self._k_dyn_thr_low.to(device=device, dtype=dtype).view(1, h, 1, d)
+            thr_high = self._k_dyn_thr_high.to(device=device, dtype=dtype).view(1, h, 1, d)
         else:
             # broadcast per-(h*d)
             thr_low = self._k_thr_low.to(device=device, dtype=dtype).view(1, h, 1, d)
@@ -135,11 +145,14 @@ class KvQuantCache:
         k_outliers = torch.where(k_out_mask, k, torch.zeros_like(k))
         k_in = torch.where(k_out_mask, torch.zeros_like(k), k)
 
-        # tokenwise thresholds for V if absent: use tokenwise quantiles
+        # V outlier thresholds
         if self._v_thr_low is None or self._v_thr_high is None:
-            vf = v.float()
-            thr_low_v = torch.quantile(vf, self.outlier_percent / 2, dim=-1, keepdim=True)
-            thr_high_v = torch.quantile(vf, 1 - self.outlier_percent / 2, dim=-1, keepdim=True)
+            if self._v_dyn_thr_low is None or self._v_dyn_thr_high is None or self._v_dyn_thr_low.shape != (h, d):
+                v_hd_bt = v.permute(1, 3, 0, 2).reshape(h, d, b * t_new).float()
+                self._v_dyn_thr_low = torch.quantile(v_hd_bt, self.outlier_percent / 2.0, dim=-1).detach()
+                self._v_dyn_thr_high = torch.quantile(v_hd_bt, 1.0 - self.outlier_percent / 2.0, dim=-1).detach()
+            thr_low_v = self._v_dyn_thr_low.to(device=device, dtype=dtype).view(1, h, 1, d)
+            thr_high_v = self._v_dyn_thr_high.to(device=device, dtype=dtype).view(1, h, 1, d)
         else:
             thr_low_v = self._v_thr_low.to(device=device, dtype=dtype).view(1, h, 1, d)
             thr_high_v = self._v_thr_high.to(device=device, dtype=dtype).view(1, h, 1, d)

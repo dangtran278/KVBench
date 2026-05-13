@@ -35,7 +35,12 @@ from datasets import load_dataset
 from kvbench.bench_utils import cuda_peak_memory_gb, reset_cuda_peak_stats, time_cuda_callable_ms
 from kvbench.config import KvQuantConfig
 from kvbench.hf_utils import load_model_and_tokenizer, perplexity_on_tokens
-from kvbench.modeling_patch import collect_kivi_telemetry, patch_hf_model_kv_cache, reset_kvbench_state
+from kvbench.modeling_patch import (
+    collect_kivi_telemetry,
+    collect_kvquant_telemetry,
+    patch_hf_model_kv_cache,
+    reset_kvbench_state,
+)
 from run_passkey import build_passkey_prompt, extract_passkey_prediction, greedy_decode_next_tokens
 
 
@@ -91,6 +96,66 @@ def append_jsonl(path: str, rows: list[dict]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def flush_kivi_telemetry(
+    model,
+    *,
+    telemetry_path: str,
+    metrics_path: str,
+    run_id: str,
+) -> None:
+    rows = collect_kivi_telemetry(model, clear=True) + collect_kvquant_telemetry(model, clear=True)
+    append_jsonl(telemetry_path, rows)
+    if not rows:
+        return
+    backend_counts: dict[str, int] = {}
+    total = 0
+    for row in rows:
+        if row.get("event") not in ("fused_kivi_qk", "fused_kvquant_qk"):
+            continue
+        backend = str(row.get("backend", "unknown"))
+        backend_counts[backend] = backend_counts.get(backend, 0) + 1
+        total += 1
+    if total <= 0:
+        return
+    append_csv(
+        metrics_path,
+        METRICS_COLUMNS,
+        {
+            "run_id": run_id,
+            "metric_name": "fused_qk_events_total",
+            "metric_value": total,
+            "unit": "count",
+            "split": "debug",
+            "notes": "decode fused QK backend events",
+        },
+    )
+    for backend, count in sorted(backend_counts.items()):
+        append_csv(
+            metrics_path,
+            METRICS_COLUMNS,
+            {
+                "run_id": run_id,
+                "metric_name": f"fused_qk_events_{backend}",
+                "metric_value": count,
+                "unit": "count",
+                "split": "debug",
+                "notes": f"backend={backend}",
+            },
+        )
+        append_csv(
+            metrics_path,
+            METRICS_COLUMNS,
+            {
+                "run_id": run_id,
+                "metric_name": f"fused_qk_ratio_{backend}",
+                "metric_value": float(count) / float(total),
+                "unit": "ratio",
+                "split": "debug",
+                "notes": f"backend={backend}",
+            },
+        )
 
 
 def method_params(method: str) -> dict:
@@ -305,19 +370,35 @@ def main() -> None:
     ap.add_argument("--run_latency", action="store_true", help="Run decode latency task")
     ap.add_argument("--run_throughput", action="store_true", help="Run throughput and max batch task")
     ap.add_argument("--run_scaling", action="store_true", help="Run memory scaling across contexts")
-    ap.add_argument("--latency_context_tokens", type=int, default=4096)
+    ap.add_argument("--latency_context_tokens", type=int, nargs="+", default=[4096])
     ap.add_argument("--latency_decode_tokens", type=int, default=64)
     ap.add_argument("--latency_warmup_tokens", type=int, default=8)
     ap.add_argument("--throughput_context_tokens", type=int, default=4096)
     ap.add_argument("--throughput_batch_sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     ap.add_argument("--chunked_prefill_tokens", type=int, default=0, help="If >0, prefill in chunks of this size")
-    ap.add_argument("--kivi_mode", type=str, default="legacy", choices=["legacy", "official_like"])
+    ap.add_argument("--kivi_mode", type=str, default="official_like", choices=["legacy", "official_like"])
     ap.add_argument("--k_residual_length", type=int, default=None)
     ap.add_argument("--v_residual_length", type=int, default=None)
     ap.add_argument("--kivi_diagnostics", action="store_true")
     ap.add_argument("--kivi_parity_checks", action="store_true")
     ap.add_argument("--kivi_drift_probe_interval", type=int, default=0)
     ap.add_argument("--kivi_telemetry", action="store_true", help="Write KIVI cache telemetry jsonl records")
+    ap.add_argument("--kivi_enable_fused_qk", action="store_true", help="Enable decode fused K-side QK path for KIVI")
+    ap.add_argument(
+        "--kivi_fused_qk_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "triton", "torch"],
+        help="Backend for fused KIVI QK path (auto/triton/torch).",
+    )
+    ap.add_argument("--kvquant_enable_fused_qk", action="store_true", help="Enable decode fused K-side QK path for KVQuant")
+    ap.add_argument(
+        "--kvquant_fused_qk_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "triton", "torch"],
+        help="Backend for fused KVQuant QK path (auto/triton/torch).",
+    )
     args = ap.parse_args()
 
     if not args.run_ppl and not args.run_passkey and not args.run_memory and not args.run_latency and not args.run_throughput and not args.run_scaling:
@@ -360,6 +441,10 @@ def main() -> None:
             kivi_diagnostics=args.kivi_diagnostics,
             kivi_parity_checks=args.kivi_parity_checks,
             kivi_drift_probe_interval=args.kivi_drift_probe_interval,
+            kivi_enable_fused_qk=args.kivi_enable_fused_qk,
+            kivi_fused_qk_backend=args.kivi_fused_qk_backend,
+            kvquant_enable_fused_qk=args.kvquant_enable_fused_qk,
+            kvquant_fused_qk_backend=args.kvquant_fused_qk_backend,
         )
 
         if args.run_ppl:
@@ -422,12 +507,14 @@ def main() -> None:
                             f"max_tokens={args.ppl_tokens},prefill_tokens={effective_ppl_prefill},kivi_mode={args.kivi_mode},"
                             f"k_residual_length={args.k_residual_length},v_residual_length={args.v_residual_length},"
                             f"kivi_diagnostics={int(args.kivi_diagnostics)},kivi_parity_checks={int(args.kivi_parity_checks)},"
-                            f"kivi_drift_probe_interval={args.kivi_drift_probe_interval},kivi_telemetry={int(args.kivi_telemetry)}"
+                            f"kivi_drift_probe_interval={args.kivi_drift_probe_interval},kivi_telemetry={int(args.kivi_telemetry)},"
+                            f"kivi_enable_fused_qk={int(args.kivi_enable_fused_qk)},kivi_fused_qk_backend={args.kivi_fused_qk_backend},"
+                            f"kvquant_enable_fused_qk={int(args.kvquant_enable_fused_qk)},kvquant_fused_qk_backend={args.kvquant_fused_qk_backend}"
                         ),
                     },
                 )
-            if args.kivi_telemetry and method.startswith("kivi"):
-                append_jsonl(telemetry_path, collect_kivi_telemetry(model, clear=True))
+            if args.kivi_telemetry and method.startswith(("kivi", "kvquant")):
+                flush_kivi_telemetry(model, telemetry_path=telemetry_path, metrics_path=metrics_path, run_id=run_id)
 
         if args.run_passkey:
             for context_len in args.passkey_contexts:
@@ -493,8 +580,8 @@ def main() -> None:
                             "notes": f"context_len={context_len},target={key},pred={pred},tail={tail}",
                         },
                     )
-                if args.kivi_telemetry and method.startswith("kivi"):
-                    append_jsonl(telemetry_path, collect_kivi_telemetry(model, clear=True))
+                if args.kivi_telemetry and method.startswith(("kivi", "kvquant")):
+                    flush_kivi_telemetry(model, telemetry_path=telemetry_path, metrics_path=metrics_path, run_id=run_id)
 
         if args.run_memory:
             for context_len in args.passkey_contexts:
@@ -561,8 +648,8 @@ def main() -> None:
                             "notes": f"context_len={context_len},decode_tokens={args.decode_tokens},kind=allocated",
                         },
                     )
-                if args.kivi_telemetry and method.startswith("kivi"):
-                    append_jsonl(telemetry_path, collect_kivi_telemetry(model, clear=True))
+                if args.kivi_telemetry and method.startswith(("kivi", "kvquant")):
+                    flush_kivi_telemetry(model, telemetry_path=telemetry_path, metrics_path=metrics_path, run_id=run_id)
                     append_csv(
                         metrics_path,
                         METRICS_COLUMNS,
@@ -577,70 +664,71 @@ def main() -> None:
                     )
 
         if args.run_latency:
-            run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
-            err = ""
-            success = 0
-            oom = 0
-            latency = None
-            try:
-                out = run_decode_latency_task(
-                    model,
-                    tok,
-                    context_tokens=args.latency_context_tokens,
-                    decode_tokens=args.latency_decode_tokens,
-                    warmup_tokens=args.latency_warmup_tokens,
-                    seed=args.seed,
-                    device=args.device,
-                    chunked_prefill_tokens=args.chunked_prefill_tokens,
-                )
-                latency = out["decode_latency_ms_per_token"]
-                success = 1
-            except RuntimeError as e:
-                err = str(e)
-                if "out of memory" in err.lower():
-                    oom = 1
-            except Exception:
-                err = traceback.format_exc(limit=1).strip().replace("\n", " ")
+            for latency_ctx in args.latency_context_tokens:
+                run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+                err = ""
+                success = 0
+                oom = 0
+                latency = None
+                try:
+                    out = run_decode_latency_task(
+                        model,
+                        tok,
+                        context_tokens=latency_ctx,
+                        decode_tokens=args.latency_decode_tokens,
+                        warmup_tokens=args.latency_warmup_tokens,
+                        seed=args.seed,
+                        device=args.device,
+                        chunked_prefill_tokens=args.chunked_prefill_tokens,
+                    )
+                    latency = out["decode_latency_ms_per_token"]
+                    success = 1
+                except RuntimeError as e:
+                    err = str(e)
+                    if "out of memory" in err.lower():
+                        oom = 1
+                except Exception:
+                    err = traceback.format_exc(limit=1).strip().replace("\n", " ")
 
-            append_csv(
-                runs_path,
-                RUNS_COLUMNS,
-                {
-                    "run_id": run_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "model": "llama3_8b",
-                    "method": method,
-                    "bits": params["nuq_bits"] if "kvquant" in method else params["k_bits"],
-                    "outlier_percent": params["outlier_percent"],
-                    "group_size": cfg.group_size,
-                    "residual_length": cfg.residual_length,
-                    "first_few_fp16": cfg.first_few_fp16,
-                    "task": "decode_latency",
-                    "context_len": args.latency_context_tokens,
-                    "batch_size": 1,
-                    "prefill_tokens": args.latency_context_tokens,
-                    "decode_tokens": args.latency_decode_tokens,
-                    "seed": args.seed,
-                    "success": success,
-                    "oom": oom,
-                    "error_msg": err,
-                },
-            )
-            if latency is not None:
                 append_csv(
-                    metrics_path,
-                    METRICS_COLUMNS,
+                    runs_path,
+                    RUNS_COLUMNS,
                     {
                         "run_id": run_id,
-                        "metric_name": "decode_latency_ms_per_token",
-                        "metric_value": latency,
-                        "unit": "ms/token",
-                        "split": "eval",
-                        "notes": f"context_len={args.latency_context_tokens},decode_tokens={args.latency_decode_tokens},warmup={args.latency_warmup_tokens}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "model": "llama3_8b",
+                        "method": method,
+                        "bits": params["nuq_bits"] if "kvquant" in method else params["k_bits"],
+                        "outlier_percent": params["outlier_percent"],
+                        "group_size": cfg.group_size,
+                        "residual_length": cfg.residual_length,
+                        "first_few_fp16": cfg.first_few_fp16,
+                        "task": "decode_latency",
+                        "context_len": latency_ctx,
+                        "batch_size": 1,
+                        "prefill_tokens": latency_ctx,
+                        "decode_tokens": args.latency_decode_tokens,
+                        "seed": args.seed,
+                        "success": success,
+                        "oom": oom,
+                        "error_msg": err,
                     },
                 )
-            if args.kivi_telemetry and method.startswith("kivi"):
-                append_jsonl(telemetry_path, collect_kivi_telemetry(model, clear=True))
+                if latency is not None:
+                    append_csv(
+                        metrics_path,
+                        METRICS_COLUMNS,
+                        {
+                            "run_id": run_id,
+                            "metric_name": "decode_latency_ms_per_token",
+                            "metric_value": latency,
+                            "unit": "ms/token",
+                            "split": "eval",
+                            "notes": f"context_len={latency_ctx},decode_tokens={args.latency_decode_tokens},warmup={args.latency_warmup_tokens}",
+                        },
+                    )
+                if args.kivi_telemetry and method.startswith(("kivi", "kvquant")):
+                    flush_kivi_telemetry(model, telemetry_path=telemetry_path, metrics_path=metrics_path, run_id=run_id)
 
         if args.run_throughput:
             max_ok_batch = 0
@@ -712,8 +800,8 @@ def main() -> None:
                             "notes": f"context_len={args.throughput_context_tokens},batch_size={batch_size}",
                         },
                     )
-                if args.kivi_telemetry and method.startswith("kivi"):
-                    append_jsonl(telemetry_path, collect_kivi_telemetry(model, clear=True))
+                if args.kivi_telemetry and method.startswith(("kivi", "kvquant")):
+                    flush_kivi_telemetry(model, telemetry_path=telemetry_path, metrics_path=metrics_path, run_id=run_id)
                     append_csv(
                         metrics_path,
                         METRICS_COLUMNS,
@@ -835,8 +923,8 @@ def main() -> None:
                             "notes": f"context_len={context_len}",
                         },
                     )
-                if args.kivi_telemetry and method.startswith("kivi"):
-                    append_jsonl(telemetry_path, collect_kivi_telemetry(model, clear=True))
+                if args.kivi_telemetry and method.startswith(("kivi", "kvquant")):
+                    flush_kivi_telemetry(model, telemetry_path=telemetry_path, metrics_path=metrics_path, run_id=run_id)
                 if oom == 1:
                     break
 
