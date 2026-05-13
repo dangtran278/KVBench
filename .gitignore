@@ -212,3 +212,4 @@ datasets/
 logs/
 KIVI/
 KVQuant/
+/logs_*

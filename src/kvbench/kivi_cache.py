@@ -200,9 +200,9 @@ class KiviCache:
     def _flush_if_full_legacy(self, state: KiviCacheState, *, out_dtype: torch.dtype) -> None:
         if state.k_fp is None or state.v_fp is None:
             return
-        # Strict paper queue semantics: when residual reaches R, flush exactly R tokens
-        # to quant storage and reset the fp residual (keeping only the remainder < R).
-        while state.k_fp is not None and state.k_fp.shape[-2] >= self.k_residual_length:
+        # Flush in R-token blocks until exactly R tokens remain in the FP16 residual.
+        # Uses strict > (not >=) so that a full R-token window is always preserved.
+        while state.k_fp is not None and state.k_fp.shape[-2] > self.k_residual_length:
             k_flush = state.k_fp[..., : self.k_residual_length, :]
             v_flush = state.v_fp[..., : self.k_residual_length, :]
             state.k_fp = state.k_fp[..., self.k_residual_length :, :]
